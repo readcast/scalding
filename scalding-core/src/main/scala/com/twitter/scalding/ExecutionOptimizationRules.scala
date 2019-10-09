@@ -1,6 +1,9 @@
 package com.twitter.scalding
 
 import com.stripe.dagon.{Dag, FunctionK, Literal, Memoize, PartialRule, Rule}
+import com.twitter.scalding.ExecutionOptimizationRules.ZipMap.{MapLeft, MapRight}
+import com.twitter.scalding.typed.functions.ComposedFunctions.ComposedMapFn
+import com.twitter.scalding.typed.functions.{ComposedFunctions, Identity, Swap}
 import scala.annotation.tailrec
 import scala.concurrent.{Future, ExecutionContext => ConcurrentExecutionContext}
 
@@ -71,7 +74,7 @@ object ExecutionOptimizationRules {
    * Everything else we are considering as fast execution compare to `FlowDefExecution` and `WriteExecution`.
    */
   def isFastExecution[A](e: Execution[A]): Boolean =
-    areFastExecution(List(e))
+    areFastExecution(e :: Nil)
 
   /**
    * If `Execution` is `FlowDefExecution` or `WriteExecution`,
@@ -108,24 +111,163 @@ object ExecutionOptimizationRules {
         }
     }
 
-  object ZipWrite extends PartialRule[Execution] {
-    type InputType = (Config, Mode, Execution.Writer, ConcurrentExecutionContext)
-    type ResFun[T] =  InputType => Future[T]
+  /**
+   * This is a rather complex optimization rule, but also very important.
+   * After this runs, there will only be 1 WriteExecution in a graph,
+   * other than within recoverWith/flatMap/uniqueId nodes.
+   *
+   * This is the best we can do without running those functions.
+   * The motivation for this is to allow the user to write Executions
+   * as is convenient in code, but still have full access to a TypedPipe
+   * graph when planning a stage. Without this, we can wind up recomputing
+   * work that we don't need to do.
+   */
+  case object ZipWrite extends Rule[Execution] {
+    import Execution._
 
-    case class NewFn[T, U](left: ResFun[T], right: ResFun[U]) extends (InputType => Future[(T, U)]) {
-      override def apply(tup: InputType): Future[(T, U)] =
-        Execution.failFastZip(left(tup), right(tup))(tup._4)
+    /*
+     * First we define some case class functions to make sure
+     * the rule is reproducible and doesn't break equality
+     */
+    case class Twist[A, B, C]() extends Function1[((A, B), C), (A, (B, C))] {
+      def apply(in: ((A, B), C)) =
+        (in._1._1, (in._1._2, in._2))
+    }
+    case class UnTwist[A, B, C]() extends Function1[(A, (B, C)), ((A, B), C)] {
+      def apply(in: (A, (B, C))) =
+        ((in._1, in._2._1), in._2._2)
+    }
+    case class TwistSwap[A, B, C]() extends Function1[(A, (B, C)), (B, (A, C))] {
+      def apply(in: (A, (B, C))) =
+        (in._2._1, (in._1, in._2._2))
+    }
+    case class ComposedFn[A1, A2, A, B1, B2, B](
+      fn1: Function1[(A1, A2), A],
+      fn2: Function1[(B1, B2), B]
+    ) extends Function1[((A1, B1), (A2, B2)), (A, B)] {
+      override def apply(v1: ((A1, B1), (A2, B2))): (A, B) = (fn1(v1._1._1, v1._2._1), fn2(v1._1._2, v1._2._2))
     }
 
-    override def applyWhere[T](on: Dag[Execution]) = {
-      /*
-      * run this and that in parallel, without any dependency. This will
-      * be done in a single cascading flow if possible.
-      *
-      * If both sides are write executions then merge them
-      */
-      case Execution.Zipped(Execution.WriteExecution(oH, oT, oR), Execution.WriteExecution(tH, tT, tR)) =>
-        Execution.WriteExecution(oH, tH :: tT ::: oT, NewFn(oR, tR))
+    case class ComposeWriteFn[A, B, C, D, E](
+      fn1: ((A, B, C, ConcurrentExecutionContext)) => Future[D],
+      fn2: ((A, B, C, ConcurrentExecutionContext)) => Future[E]) extends Function1[(A, B, C, ConcurrentExecutionContext), Future[(D, E)]] {
+
+      def apply(tup: (A, B, C, ConcurrentExecutionContext)): Future[(D, E)] =
+        (Execution.failFastZip(fn1(tup), fn2(tup))(tup._4))
+    }
+
+    def mergeWrite[A, B](w1: WriteExecution[A], w2: WriteExecution[B]): WriteExecution[(A, B)] = {
+      val newFn = ComposeWriteFn(w1.result, w2.result)
+      WriteExecution(w1.head, w1.tail ::: (w2.head :: w2.tail), newFn)
+    }
+
+    /**
+     * This is the fundamental type we use to optimize zips, basically we
+     * expand graphs of WriteExecution, Zipped, Mapped.
+     * Our goal to optimize any `Execution`'s DAG to have at most one write.
+     *
+     * This is achieved by optimizing any `Execution` to either:
+     * - `NonWrite` execution
+     * - `Write` execution
+     * - composed execution which has both write and non write.
+     */
+    private sealed trait FlattenedZip[+A]
+
+    private object FlattenedZip {
+      final case class NonWrite[T](nonWrite: Execution[T]) extends FlattenedZip[T]
+      final case class Write[T](write: WriteExecution[T]) extends FlattenedZip[T]
+      final case class Composed[T1, T2, T](write: WriteExecution[T1], nonWrite: Execution[T2], compose: Function1[(T1, T2), T]) extends FlattenedZip[T]
+
+      def toExecution[A](ex: FlattenedZip[A]): Execution[A] = ex match {
+        case NonWrite(nonWrite) => nonWrite
+        case Write(write) => write
+        case c@Composed(_, _, _) => c.write.zip(c.nonWrite).map(c.compose)
+      }
+
+      def map[A, B](ex: FlattenedZip[A], fn: A => B): FlattenedZip[B] = ex match {
+        case NonWrite(nonWrite) =>
+          NonWrite(nonWrite.map(fn))
+        case Write(write) =>
+          Write(WriteExecution(write.head, write.tail, MapWrite.ComposeMap(write.result, fn)))
+        case Composed(write, nonWrite, compose) =>
+          Composed(write, nonWrite, ComposedMapFn(compose, fn))
+      }
+
+      def zip[A, B](left: FlattenedZip[A], right: FlattenedZip[B]): FlattenedZip[(A, B)] = (left, right) match {
+        case (left@NonWrite(_), right@NonWrite(_)) =>
+          NonWrite(left.nonWrite.zip(right.nonWrite))
+        case (left@NonWrite(_), right@Write(_)) =>
+          Composed(right.write, left.nonWrite, Swap[B, A]())
+        case (left@NonWrite(_), right@Composed(_, _, _)) =>
+          zipNonWriteComposed(left, right)
+
+        case (left@Write(_), right@NonWrite(_)) =>
+          Composed(left.write, right.nonWrite, Identity[(A, B)]())
+        case (left@Write(_), right@Write(_)) =>
+          Write(mergeWrite(left.write, right.write))
+        case (left@Write(_), right@Composed(_, _, _)) =>
+          zipWriteComposed(left, right)
+
+        case (left@Composed(_, _, _), right@NonWrite(_)) =>
+          map(zipNonWriteComposed(right, left), Swap[B, A]())
+        case (left@Composed(_, _, _), right@Write(_)) =>
+          map(zipWriteComposed(right, left), Swap[B, A]())
+        case (left@Composed(_, _, _), right@Composed(_, _, _)) =>
+          Composed(mergeWrite(left.write, right.write), left.nonWrite.zip(right.nonWrite),
+            ComposedFn(left.compose, right.compose))
+      }
+
+      private def zipNonWriteComposed[A, B1, B2, B](left: NonWrite[A], right: Composed[B1, B2, B]): Composed[B1, (B2, A), (A, B)] =
+        Composed(right.write, right.nonWrite.zip(left.nonWrite),
+          ComposedMapFn(ComposedMapFn(UnTwist(), MapLeft[(B1, B2), A, B](right.compose)), Swap[B, A]()))
+
+      private def zipWriteComposed[A, B1, B2, B](left: Write[A], right: Composed[B1, B2, B]): Composed[(A, B1), B2, (A, B)] =
+        Composed(mergeWrite(left.write, right.write), right.nonWrite,
+          ComposedMapFn(Twist(), MapRight[A, (B1, B2), B](right.compose)))
+
+      /**
+       * Convert an Execution to the Flattened (tuple-ized) representation
+       */
+      def apply[A](ex: Execution[A]): FlattenedZip[A] =
+        ex match {
+          case Zipped(left, right) => zip(apply(left), apply(right))
+          case Mapped(that, fn) => map(apply(that), fn)
+          case write@WriteExecution(_, _, _) => FlattenedZip.Write(write)
+          case notZipMap => FlattenedZip.NonWrite(notZipMap)
+        }
+    }
+
+    /**
+     * Apply the optimization of merging all zipped/mapped WriteExecution
+     * into a single value. If ex is already optimal (0 or 1 write) return None
+     */
+    def optimize[A](ex: Execution[A]): Option[Execution[A]] = {
+      def writes(execution: Execution[_]): Int = {
+        @tailrec
+        def loop(executions: List[Execution[_]], acc: Int): Int = executions match {
+          case Nil => acc
+          case head :: tail => head match {
+            case Zipped(left, right) => loop(left :: right :: tail, acc)
+            case Mapped(that, _) => loop(that :: tail, acc)
+            case WriteExecution(_, _, _) => loop(tail, acc + 1)
+            case _ => loop(tail, acc)
+          }
+        }
+        loop(execution :: Nil, 0)
+      }
+      // only optimize if there are 2 or more writes, otherwise we create an infinite loop
+      if (writes(ex) > 1)
+        Some(FlattenedZip.toExecution(FlattenedZip(ex)))
+      else
+        None
+    }
+
+    def apply[A](on: Dag[Execution]) = {
+      case z@Zipped(_, _) => optimize(z)
+      case _ =>
+        // since this optimization only applies to zips, there
+        // is no need to check on nodes that aren't zips.
+        None
     }
   }
 
@@ -178,11 +320,28 @@ object ExecutionOptimizationRules {
   }
 
   object MapWrite extends PartialRule[Execution] {
+    case class ComposeMap[A, B, C, D, E](
+      fn1: ((A, B, C, ConcurrentExecutionContext)) => Future[D],
+      fn2: D => E) extends Function1[(A, B, C, ConcurrentExecutionContext), Future[E]] {
+
+      def apply(tup: (A, B, C, ConcurrentExecutionContext)): Future[E] =
+        fn1(tup).map(fn2)(tup._4)
+    }
+
     override def applyWhere[T](on: Dag[Execution]) = {
-      case Execution.Mapped(write@ Execution.WriteExecution(_, _, _), fn) =>
-        write.map(fn)
+      case Execution.Mapped(Execution.WriteExecution(h, t, f1), f2) =>
+        Execution.WriteExecution(h, t, ComposeMap(f1, f2))
     }
   }
+
+  case object FuseMaps extends PartialRule[Execution] {
+    import Execution._
+    def applyWhere[A](on: Dag[Execution]) = {
+      case Mapped(Mapped(ex, fn0), fn1) =>
+        Mapped(ex, ComposedFunctions.ComposedMapFn(fn0, fn1))
+    }
+  }
+
 
   val std: Rule[Execution] =
     Rule.orElse(
@@ -190,7 +349,8 @@ object ExecutionOptimizationRules {
         ZipWrite,
         MapWrite,
         ZipMap,
-        ZipFlatMap
+        ZipFlatMap,
+        FuseMaps
       )
     )
 

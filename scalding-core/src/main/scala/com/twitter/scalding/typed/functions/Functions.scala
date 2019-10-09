@@ -131,7 +131,11 @@ case class DropValue1[A, B, C]() extends Function1[(A, (B, C)), (A, C)] {
 
 case class RandomNextInt(seed: Long, modulus: Int) extends Function1[Any, Int] {
   private[this] lazy val rng = new Random(seed)
-  def apply(a: Any) = rng.nextInt(modulus)
+  def apply(a: Any) = {
+    val raw = rng.nextInt(modulus) + a.hashCode()
+    val mod = raw % modulus
+    if (mod >= 0) mod else mod + modulus
+  }
 }
 
 case class RandomFilter(seed: Long, fraction: Double) extends Function1[Any, Boolean] {
@@ -222,6 +226,10 @@ case class FlatMapValuesToFlatMap[K, A, B](fn: A => TraversableOnce[B]) extends 
     val k = ka._1
     fn(ka._2).map((k, _))
   }
+}
+
+case class MergeFlatMaps[A, B](fns: Iterable[A => TraversableOnce[B]]) extends Function1[A, TraversableOnce[B]] {
+  def apply(a: A) = fns.iterator.flatMap { fn => fn(a) }
 }
 
 case class MapValuesToMap[K, A, B](fn: A => B) extends Function1[(K, A), (K, B)] {

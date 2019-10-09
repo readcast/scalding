@@ -15,7 +15,7 @@ def scalaBinaryVersion(scalaVersion: String) = scalaVersion match {
 }
 val algebirdVersion = "0.13.4"
 val apacheCommonsVersion = "2.2"
-val avroVersion = "1.7.4"
+val avroVersion = "1.8.2"
 val bijectionVersion = "0.9.5"
 val cascadingAvroVersion = "2.1.2"
 val catsEffectVersion = "1.1.0"
@@ -40,7 +40,6 @@ val sparkVersion = "2.4.0"
 val slf4jVersion = "1.6.6"
 val thriftVersion = "0.9.3"
 val junitVersion = "4.10"
-val macroCompatVersion = "1.1.1"
 val jlineVersion = "2.14.3"
 
 val printDependencyClasspath = taskKey[Unit]("Prints location of the dependencies")
@@ -50,7 +49,7 @@ val sharedSettings = assemblySettings ++ scalariformSettings ++ Seq(
 
   scalaVersion := "2.11.12",
 
-  crossScalaVersions := Seq(scalaVersion.value, "2.12.4"),
+  crossScalaVersions := Seq(scalaVersion.value, "2.12.8"),
 
   ScalariformKeys.preferences := formattingPreferences,
 
@@ -74,7 +73,7 @@ val sharedSettings = assemblySettings ++ scalariformSettings ++ Seq(
     Opts.resolver.mavenLocalFile,
     Opts.resolver.sonatypeSnapshots,
     Opts.resolver.sonatypeReleases,
-    "Concurrent Maven Repo" at "http://conjars.org/repo",
+    "Concurrent Maven Repo" at "https://conjars.org/repo",
     "Twitter Maven" at "https://maven.twttr.com",
     "Cloudera" at "https://repository.cloudera.com/artifactory/cloudera-repos/"
   ),
@@ -197,17 +196,17 @@ val sharedSettings = assemblySettings ++ scalariformSettings ++ Seq(
         <developer>
           <id>posco</id>
           <name>Oscar Boykin</name>
-          <url>http://twitter.com/posco</url>
+          <url>https://twitter.com/posco</url>
         </developer>
         <developer>
           <id>avibryant</id>
           <name>Avi Bryant</name>
-          <url>http://twitter.com/avibryant</url>
+          <url>https://twitter.com/avibryant</url>
         </developer>
         <developer>
           <id>argyris</id>
           <name>Argyris Zymnis</name>
-          <url>http://twitter.com/argyris</url>
+          <url>https://twitter.com/argyris</url>
         </developer>
       </developers>)
 ) ++ mimaDefaultSettings
@@ -426,8 +425,7 @@ lazy val scaldingParquet = module("parquet").settings(
     "org.scala-lang" % "scala-reflect" % scalaVersion.value,
     "com.twitter" %% "bijection-macros" % bijectionVersion,
     "com.twitter" %% "chill-bijection" % chillVersion,
-    "com.twitter.elephantbird" % "elephant-bird-core" % elephantbirdVersion % "test",
-    "org.typelevel" %% "macro-compat" % macroCompatVersion
+    "com.twitter.elephantbird" % "elephant-bird-core" % elephantbirdVersion % "test"
     ),
   addCompilerPlugin("org.scalamacros" % "paradise" % paradiseVersion cross CrossVersion.full))
   .dependsOn(scaldingCore, scaldingHadoopTest % "test", scaldingParquetFixtures % "test->test")
@@ -513,9 +511,7 @@ lazy val scaldingRepl = module("repl")
       "org.slf4j" % "slf4j-api" % slf4jVersion,
       "org.slf4j" % "slf4j-log4j12" % slf4jVersion % "provided",
       "org.slf4j" % "slf4j-log4j12" % slf4jVersion % "unprovided"
-    ),
-    // https://gist.github.com/djspiewak/976cd8ac65e20e136f05
-    unmanagedSourceDirectories in Compile += (sourceDirectory in Compile).value / s"scala-${scalaBinaryVersion(scalaVersion.value)}"
+    )
 ).dependsOn(scaldingCore)
 // run with 'unprovided' config includes libs marked 'unprovided' in classpath
 .settings(inConfig(Unprovided)(Classpaths.configSettings ++ Seq(
@@ -693,7 +689,7 @@ lazy val docSettings = Seq(
   micrositeDescription := "Scala API for Cascading.",
   micrositeAuthor := "Scalding's contributors",
   micrositeHighlightTheme := "atom-one-light",
-  micrositeHomepage := "http://twitter.github.io/scalding",
+  micrositeHomepage := "https://twitter.github.io/scalding",
   micrositeBaseUrl := "scalding",
   micrositeDocumentationUrl := "api",
   micrositeGithubOwner := "twitter",

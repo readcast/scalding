@@ -15,8 +15,8 @@ limitations under the License.
 */
 package com.twitter.scalding
 
-import org.scalatest.{FunSuite, Matchers, WordSpec}
-import com.twitter.scalding.source.{FixedTypedText, TypedText}
+import org.scalatest.{ FunSuite, Matchers, WordSpec }
+import com.twitter.scalding.source.{ FixedTypedText, TypedText }
 import scala.collection.mutable
 // Use the scalacheck generators
 import org.scalacheck.Gen
@@ -29,6 +29,13 @@ import typed.MultiJoin
 object TUtil {
   def printStack(fn: => Unit): Unit = {
     try { fn } catch { case e: Throwable => e.printStackTrace; throw e }
+  }
+
+  implicit class JobTestExt(test: JobTest) {
+    def writesLessDataThen(limitInBytes: Int): JobTest = test
+      .counter("BYTES_WRITTEN", group = "org.apache.hadoop.mapreduce.lib.output.FileOutputFormatCounter") {
+        value => assert(value < limitInBytes, s"Job wrote $value bytes of data with limit $limitInBytes")
+      }
   }
 }
 
@@ -348,6 +355,19 @@ class TypedPipeHashJoinTest extends WordSpec with Matchers {
       }(implicitly[TypeDescriptor[(Int, (Int, Option[Int]))]].converter)
       .run
       .finish()
+  }
+}
+
+class TypedPipeTwoHashJoinsInARowTest extends WordSpec with Matchers {
+  "Two hashJoins" should {
+    "work correctly" in {
+      val elements = List(1, 2, 3)
+      val tp1 = TypedPipe.from(elements.map(v => (v, v)))
+      val tp2 = TypedPipe.from(elements.map(v => (v, 2 * v)))
+      val tp3 = TypedPipe.from(elements.map(v => (v, 3 * v)))
+      TypedPipeChecker.checkOutput(tp1.hashJoin(tp2).hashJoin(tp3))(result =>
+        result shouldBe elements.map(v => (v, ((v, 2 * v), 3 * v))))
+    }
   }
 }
 
@@ -1536,5 +1556,92 @@ class TypedPipeConverterTest extends FunSuite {
       .finish()
 
     assert(result == expected)
+  }
+}
+
+object TypedPipeCrossWithMapWithToPipeTest {
+  val source = TypedText.tsv[Int]("source")
+
+  val sink1 = TypedText.tsv[Int]("sink1")
+  val sink2 = TypedText.tsv[Int]("sink2")
+
+  class TestJob(args: Args) extends Job(args) {
+    val mapPipe: TypedPipe[Map[Int, Int]] = TypedPipe.from(source)
+      .groupAll
+      .toList
+      .mapValues(values => values.map(v => (v, v)).toMap)
+      .values
+
+    val crossedMapped = TypedPipe.from(source)
+      .cross(mapPipe)
+      .map { case (value, map) => map(value) }
+
+    crossedMapped.toPipe('value).write(sink1)
+    crossedMapped.map(identity).toPipe('value).write(sink2)
+  }
+}
+
+class TypedPipeCrossWithMapWithToPipeTest extends FunSuite {
+  import TypedPipeCrossWithMapWithToPipeTest._
+  import TUtil._
+
+  test("data between cross and subsequent map shouldn't be materialized") {
+    val n = 3000
+    val bytesPerElement = 100 // we shouldn't write more than 100 bytes per element
+    val values = 1 to n
+
+    JobTest(new TestJob(_))
+      .source(source, values)
+      .typedSink(sink1) { outBuf =>
+        assert(outBuf.toSet == values.toSet)
+      }
+      .typedSink(sink2) { outBuf =>
+        assert(outBuf.toSet == values.toSet)
+      }
+      .writesLessDataThen(bytesPerElement * n)
+      .runHadoop
+      .finish()
+  }
+}
+
+object TypedPipeCrossWithDifferentMapsAfterTest {
+  val source = TypedText.tsv[Int]("source")
+
+  val sink1 = TypedText.tsv[Int]("sink1")
+  val sink2 = TypedText.tsv[Int]("sink2")
+
+  class TestJob(args: Args) extends Job(args) {
+    val mapPipe: TypedPipe[Map[Int, Int]] = TypedPipe.from(source)
+      .groupAll
+      .toList
+      .mapValues(values => values.map(v => (v, v)).toMap)
+      .values
+
+    val crossed = TypedPipe.from(source).cross(mapPipe)
+    crossed.map { case (value, map) => map(value) }.write(sink1)
+    crossed.map { case (value, map) => map(identity(value)) }.write(sink2)
+  }
+}
+
+class TypedPipeCrossWithDifferentMapsAfterTest extends FunSuite {
+  import TypedPipeCrossWithDifferentMapsAfterTest._
+  import TUtil._
+
+  test("cross data shouldn't be materialized") {
+    val n = 3000
+    val bytesPerElement = 100 // we shouldn't write more than 100 bytes per element
+    val values = 1 to n
+
+    JobTest(new TestJob(_))
+      .source(source, values)
+      .typedSink(sink1) { outBuf =>
+        assert(outBuf.toSet == values.toSet)
+      }
+      .typedSink(sink2) { outBuf =>
+        assert(outBuf.toSet == values.toSet)
+      }
+      .writesLessDataThen(bytesPerElement * n)
+      .runHadoop
+      .finish()
   }
 }

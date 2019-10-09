@@ -5,7 +5,7 @@ import com.stripe.dagon.{ HMap, Rule }
 import com.twitter.scalding.typed._
 import com.twitter.scalding.Mode
 import com.twitter.scalding.typed.memory_backend.AtomicBox
-import com.twitter.scalding.{ Config, Execution, ExecutionCounters }
+import com.twitter.scalding.{ Config, Execution, ExecutionCounters, CancellationHandler, CFuture}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
@@ -13,6 +13,8 @@ import scala.concurrent.{ Future, ExecutionContext, Promise }
 import java.util.concurrent.atomic.AtomicLong
 
 import Execution.{ ToWrite, Writer }
+
+import SparkMode.SparkConfigMethods
 
 class SparkWriter(val sparkMode: SparkMode) extends Writer {
 
@@ -47,12 +49,17 @@ class SparkWriter(val sparkMode: SparkMode) extends Writer {
       c: Config,
       init: TypedPipe[T],
       opt: TypedPipe[T],
-      rdd: Future[RDD[_ <: T]])(implicit ec: ExecutionContext): (State, Boolean) =
+      rdd: Future[RDD[_ <: T]],
+      persist: Option[StorageLevel])(implicit ec: ExecutionContext): (State, Boolean) =
 
       forcedPipes.get((c, opt)) match {
         case None =>
           // we have not previously forced this source
-          val forcedRdd: Future[RDD[_ <: T]] = rdd.map(_.persist(StorageLevel.DISK_ONLY))
+          val forcedRdd: Future[RDD[_ <: T]] =
+            persist match {
+              case None => rdd
+              case Some(level) => rdd.map(_.persist(level))
+            }
           val ssrc: SparkSource[T] = materializedSource[T](forcedRdd)
           val src: TypedSource[T] = TempSource.next()
 
@@ -137,7 +144,7 @@ class SparkWriter(val sparkMode: SparkMode) extends Writer {
    */
   def execute(
     conf: Config,
-    writes: List[ToWrite[_]])(implicit cec: ExecutionContext): Future[(Long, ExecutionCounters)] = {
+    writes: List[ToWrite[_]])(implicit cec: ExecutionContext): CFuture[(Long, ExecutionCounters)] = {
 
     val planner = SparkPlanner.plan(conf, sparkMode.sources.orElse(state.get().sources))
 
@@ -153,7 +160,12 @@ class SparkWriter(val sparkMode: SparkMode) extends Writer {
 
     def force[T](opt: TypedPipe[T], keyPipe: TypedPipe[T], oldState: State): (State, Action) = {
       val promise = Promise[RDD[_ <: T]]()
-      val (newState, added) = oldState.addForce[T](conf, keyPipe, opt, promise.future)
+      val (newState, added) = oldState.addForce[T](
+        conf,
+        init = keyPipe,
+        opt = opt,
+        promise.future,
+        conf.getForceToDiskPersistMode.orElse(Some(StorageLevel.DISK_ONLY)))
       def action = () => {
         // actually run
         val op = planner(opt)
@@ -165,7 +177,7 @@ class SparkWriter(val sparkMode: SparkMode) extends Writer {
     }
     def write[T](opt: TypedPipe[T], keyPipe: TypedPipe[T], sink: TypedSink[T], oldState: State): (State, Action) = {
       val promise = Promise[RDD[_ <: T]]()
-      val (newState, added) = oldState.addForce[T](conf, keyPipe, opt, promise.future)
+      val (newState, added) = oldState.addForce[T](conf, init = keyPipe, opt = opt, promise.future, None)
       val action = () => {
         val rddF =
           if (added) {
@@ -201,6 +213,6 @@ class SparkWriter(val sparkMode: SparkMode) extends Writer {
       (nextState.copy(id = nextState.id + 1), (nextState.id, acts))
     }
     // now we run the actions:
-    Future.traverse(acts) { fn => fn() }.map(_ => (id, ExecutionCounters.empty))
+    CFuture.uncancellable(Future.traverse(acts) { fn => fn() }.map(_ => (id, ExecutionCounters.empty)))
   }
 }
